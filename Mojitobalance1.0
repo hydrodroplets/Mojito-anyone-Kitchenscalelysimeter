@@ -1,0 +1,375 @@
+ /***************************************************
+
+
+  CODE FOR  Mojitobalance 1.0 
+
+  Serial number:   MA1001
+
+  For the publication "Mojito, anyone?" we converted a standard off the shelf kitchen scale into a "lysimeter" to measure the change in soil moisture 
+  due to evaporation and transpiration and decide when to water the rice and melon plants. As descirbed in the publication, "One of the trays rested 
+  on a kitchen alance connected to an ArduinoTM UNO micro-controller with SD-shield (AMC) to measure changes in weight due to evaporation and transpiration 
+  at 5 min intervals. In addition, AMC-connected, low-budget soil moisture sensors (HL-69) were installed into one seedling pot to monitor volumetric 
+  soil moisture content (%). The AMC information was used to monitor water content and adjust the irrigation scheme, which consisted of irrigation every 
+  2–3 days with 10 ml of water to maintain a moisture content of approximately 60–80% across both trays. " 
+  (Fischer et al. 2019, https://www.frontiersin.org/articles/10.3389/feart.2019.00150/full)
+
+  Here you can find information in case you want to build the kitchen lysimeter your self for a project or students project. Please don't forget to cite:
+  Fischer, B. M. C., Frentress, J., Manzoni, S., Cousins, S. A. O., Hugelius, G., Greger, M., et al. (2019). Mojito, Anyone? An Exploration of Low-Tech 
+  Plant Water Extraction Methods for Isotopic Analysis Using Locally-Sourced Materials. Front. Earth Sci. 7, 150. doi:10.3389/feart.2019.00150.
+
+  THIS CODE WORKS TO weigh the change in soil moisture of plants due to evaporation and transpiration, measure humitdy of the air and soil moisture and indicate 
+  with a red LED if plants need water / not and saves data at defined int. to a SD card. 
+  copyright Fischer et al. 2019
+
+  In case of bugs >-|||||:) please let me know. 
+  
+  Adafruit invests time and resources providing this open source code,
+  please support Adafruit and open-source hardware by purchasing
+  products from Adafruit!
+
+  Written by among others Limor Fried/Ladyada for Adafruit Industries and Benjamin Fischer.
+  GNU3.0 license. All text above must be included in any redistribution
+  contact|  @mail
+
+****************************************************/
+
+#include <SD.h>
+#include <Wire.h>
+#include <RTClib.h>
+#include <SPI.h>
+
+#include "HX711.h"
+
+#define DOUT  3
+#define CLK  2
+
+#include <dht.h>
+
+dht DHT;
+
+#define DHT11_PIN 5
+
+HX711 scale(DOUT, CLK);
+
+// VWC
+int sensor_pin = A0;
+int output_value ;
+
+
+float calibration_factor = -205.5; //-7050 worked for my 440lb max scale setup
+
+// A simple data logger for the Arduino analog pins
+
+// how many milliseconds between grabbing data and logging it. 1000 ms is once a second
+//#define  chipSelect   10
+#define LOG_INTERVAL   60000 // 3600000 // mills between entries (reduce to take more/faster data)
+
+// 1000 = 1 s
+// 60 000 = 60 s = 1 min
+// 3 600 000 = 60 min 
+
+// how many milliseconds before writing the logged data permanently to disk
+// set it to the LOG_INTERVAL to write each time (safest)
+// set it to 10*LOG_INTERVAL to write all data every 10 datareads, you could lose up to
+// the last 10 reads if power is lost but it uses less power and is much faster!
+#define SYNC_INTERVAL 2000 // mills between calls to flush() - to write data to the card
+uint32_t syncTime = 0; // time of last sync()
+
+#define ECHO_TO_SERIAL   1 // echo data to serial port
+#define WAIT_TO_START    0 // Wait for serial input in setup()
+
+RTC_DS1307 RTC; // define the Real Time Clock object
+
+// for the data logging shield, we use digital pin 10 for the SD cs line
+//const int chipSelect = 10;
+const int chipSelect = 10;
+
+// the logging file
+File logfile;
+File myFile;
+//void error(char *str)
+//{
+//  Serial.print("error: ");
+//  Serial.println(str);
+//
+//}
+//////////////////////////////////////////////// FLOOD SENS
+
+const int ledPin =  7;      // the number of the LED pin
+const int ledPinD =  8; 
+const int ledPinH2O = 4;
+
+// variables will change:
+////////////////////////////////////////////////
+int sensorPin = 0;  //This is the Arduino Pin that will read the sensor output
+int sensorValue = 0;    
+#define aref_voltage 3300
+
+void setup(void)
+{
+  Serial.begin(115200);
+  Serial.print(F("initial ADU \n"));
+  Serial.println();
+  pinMode(ledPin, OUTPUT);
+  pinMode(ledPinD, OUTPUT);
+  pinMode(ledPinH2O, OUTPUT);
+
+  //pinMode(TMPsens, OUTPUT);
+
+  // Scale
+  digitalWrite(ledPin, HIGH);
+  Serial.println(F("HX711 calibration sketch"));
+  Serial.println(F("Remove all weight from scale"));
+  Serial.println(F("After readings begin, place known weight on scale"));
+  Serial.println(F("Press + or a to increase calibration factor"));
+  Serial.println(F("Press - or z to decrease calibration factor"));
+
+  scale.set_scale();
+  scale.tare(); //Reset the scale to 0
+
+  long zero_factor = -154403; //scale.read_average(); //Get a baseline reading
+  Serial.print(F("Zero factor: ")); //This can be used to remove the need to tare the scale. Useful in permanent scale projects.
+  Serial.println(zero_factor);
+
+  SDINI();
+
+    delay(2000);
+  digitalWrite(ledPin, LOW);
+  digitalWrite(ledPinH2O, LOW);
+    delay(1000);
+  digitalWrite(ledPinH2O, HIGH);
+    delay(1000);
+  digitalWrite(ledPinH2O, LOW);
+}
+
+
+void loop(void)
+{
+
+  digitalWrite(ledPin, LOW);
+  delay(500);
+  digitalWrite(ledPin, HIGH);
+  delay(500);
+  digitalWrite(ledPin, LOW);
+
+  // delay for the amount of time we want between readings
+  delay((LOG_INTERVAL - 1) - (millis() % LOG_INTERVAL));
+
+  DateTime now;
+  digitalWrite(ledPin, HIGH);
+
+  // log milliseconds since starting
+  uint32_t m = millis();
+  logfile.print(m);           // milliseconds since start
+  logfile.print(", ");
+#if ECHO_TO_SERIAL
+  Serial.print(m);         // milliseconds since start
+  Serial.print(F(", "));
+#endif
+
+  // fetch the time
+  now = RTC.now();
+  // log time
+  logfile.print(now.unixtime()); // seconds since 1/1/1970
+  logfile.print(", ");
+  logfile.print('"');
+  logfile.print(now.year(), DEC);
+  logfile.print("/");
+  logfile.print(now.month(), DEC);
+  logfile.print("/");
+  logfile.print(now.day(), DEC);
+  logfile.print(" ");
+  logfile.print(now.hour(), DEC);
+  logfile.print(":");
+  logfile.print(now.minute(), DEC);
+  logfile.print(":");
+  logfile.print(now.second(), DEC);
+  logfile.print('"');
+#if ECHO_TO_SERIAL
+  Serial.print(now.unixtime()); // seconds since 1/1/1970
+  Serial.print(", ");
+  Serial.print('"');
+  Serial.print(now.year(), DEC);
+  Serial.print("/");
+  Serial.print(now.month(), DEC);
+  Serial.print("/");
+  Serial.print(now.day(), DEC);
+  Serial.print(" ");
+  Serial.print(now.hour(), DEC);
+  Serial.print(":");
+  Serial.print(now.minute(), DEC);
+  Serial.print(":");
+  Serial.print(now.second(), DEC);
+  Serial.print('"');
+#endif //ECHO_TO_SERIAL
+
+  //////////////////////////////////////   SENSOR
+  scale.set_scale(calibration_factor); //Adjust to this calibration factor
+
+  Serial.print(",");
+  Serial.print(F("Reading: "));
+  Serial.print(scale.get_units(), 1);
+  Serial.print(F(" g")); //Change this to kg and re-adjust the calibration factor if you follow SI units like a sane person
+
+  Serial.println();
+
+  logfile.print(", ");
+  logfile.print(scale.get_units());
+
+  delay(2000);
+
+
+  ////////// HUMI and TEMP
+  
+ 
+   int chk = DHT.read11(DHT11_PIN);
+  Serial.print("Temperature = ");
+  Serial.println(DHT.temperature);
+  Serial.print("Humidity = ");
+  Serial.println(DHT.humidity);
+  delay(1000);
+
+//  sensorValue = analogRead(sensorPin);  Serial.print( sensorValue);    Serial.print(" \n ");
+//float voltage =  (sensorValue*5);
+// voltage /= 1024.0; 
+//
+//  Serial.print( voltage); Serial.print("V");    Serial.print(" \n "); delay(1000);
+//  
+//
+//
+// 
+//  // now print out the temperature
+//  float temperatureC = (voltage - 0.5) * 100 ;  //converting from 10 mv per degree wit 500 mV offset
+//                                               //to degrees ((volatge - 500mV) times 100)
+//  Serial.print(temperatureC); Serial.println(" degrees C");
+// 
+  logfile.print(", ");
+  logfile.print(DHT.temperature);
+  logfile.print(", ");
+  logfile.print(DHT.humidity);
+  
+  delay(2000);
+ // VWC
+   output_value= analogRead(sensor_pin);
+   
+   Serial.print("output_value ");
+   Serial.print(output_value);
+
+   logfile.print(", ");
+   logfile.print(output_value);
+    
+   Serial.print("Moisture %");
+   output_value=(output_value*-0.0978 + 100);
+   Serial.print(output_value);
+      
+   //output_value = map(output_value,550,0,0,100);
+   //output_value = map(output_value,1023,0,100,100);
+
+   //Serial.print("Mositure : ");
+
+   //Serial.print(output_value);
+
+   
+   logfile.print(", ");
+   logfile.print(output_value);
+
+   delay(1000);
+
+   if (output_value <50) {     
+    // turn LED on:    
+        
+    Serial.print("Drougth need water");
+    
+    digitalWrite(ledPinD, HIGH);  delay(2000);
+    digitalWrite(ledPinD, LOW);  delay(2000);
+
+     
+  } 
+     for (int i=0; i < output_value/10; i++){
+       digitalWrite(ledPinH2O, HIGH);  delay(500);
+       digitalWrite(ledPinH2O, LOW);  delay(500);}
+ 
+  //////////////////
+
+#if ECHO_TO_SERIAL
+#endif //ECHO_TO_SERIAL
+
+  logfile.println();
+#if ECHO_TO_SERIAL
+  Serial.println();
+#endif // ECHO_TO_SERIAL 
+
+  /////////////// WRINTING SD
+  // Now we write data to disk! Don't sync too often - requires 2048 bytes of I/O to SD card
+  // which uses a bunch of power and takes time
+  if ((millis() - syncTime) < SYNC_INTERVAL) return;
+  syncTime = millis();
+
+  // blink LED to show we are syncing data to the card & updating FAT!
+  //  digitalWrite(redLEDpin, HIGH);
+  logfile.flush();
+
+  digitalWrite(ledPin, LOW);
+
+}
+
+void SDINI() {
+  Serial.begin(115200);
+  Serial.println();
+
+  //#if WAIT_TO_START
+  //  Serial.println("Type any character to start");
+  //  while (!Serial.available());
+  //#endif //WAIT_TO_START
+
+  // initialize the SD card
+  Serial.print("Initializing SD card...");
+  // make sure that the default chip select pin is set to
+  // output, even if you don't use it:
+  pinMode(10, OUTPUT);
+
+  // see if the card is present and can be initialized:
+  if (!SD.begin(10)) {
+    //    error("Card failed, or not present");
+  }
+  //  if (!SD.begin(53,47,46,52)) {
+  ////    error("Card failed, or not present");
+  //  }
+  Serial.println("card initialized.");
+
+  // create a new file
+  char filename[] = "LOGGER00.csv";
+  for (uint8_t i = 0; i < 100; i++) {
+    filename[6] = i / 10 + '0';
+    filename[7] = i % 10 + '0';
+    if (! SD.exists(filename)) {
+      // only open a new file if it doesn't exist
+      logfile = SD.open(filename, FILE_WRITE);
+      break;  // leave the loop!
+    }
+  }
+
+  //  if (! logfile) {
+  //    error("couldnt create file");
+  //  }
+
+  Serial.print(F("Logging to: "));
+  Serial.println(filename);
+
+  // connect to RTC
+  Wire.begin();
+  if (!RTC.begin()) {
+    logfile.println(F("RTC failed"));
+#if ECHO_TO_SERIAL
+    Serial.println(F("RTC failed"));
+#endif  //ECHO_TO_SERIAL
+  }
+
+  logfile.println("millis,stamp,datetime,weigth[g], T [C],Hum , VWCraw,VWC ");
+#if ECHO_TO_SERIAL
+  Serial.println(F("millis,stamp,datetime,[g],deg C,Hum,VWCRaw,VWC %"));
+#endif //ECHO_TO_SERIAL
+
+  // If you want to set the aref to something other than 5v
+  analogReference(EXTERNAL);
+}
